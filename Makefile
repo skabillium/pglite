@@ -7,6 +7,7 @@ install:
 
 clean:
 	rm -rf ./bin
+	rm -rf ./pglite-data
 
 tests:
 	go test ${CMD}/db
