@@ -26,8 +26,56 @@ func NewEngine(db *bolt.DB) *Engine {
 	return &Engine{db, []byte("data")}
 }
 
+func (ng *Engine) getTable(name string) *TableDefinition {
+	key := "tables:" + name
+	var tableDef *TableDefinition
+	ng.db.View(func(tx *bolt.Tx) error {
+		buck := tx.Bucket(ng.bucketName)
+		if buck == nil {
+			return nil
+		}
+		tb := buck.Get([]byte(key))
+		tableDef = DecodeTableDef(tb)
+		return nil
+	})
+	return tableDef
+}
+
+func (ng *Engine) writeTable(table TableDefinition) error {
+	key := []byte("tables:" + table.Name)
+	return ng.db.Update(func(tx *bolt.Tx) error {
+		buck := tx.Bucket(ng.bucketName)
+		return buck.Put(key, table.Encode())
+
+	})
+}
+
 func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
-	fmt.Println("Creating table:", stmt.Relation.Relname)
+	table := TableDefinition{Name: stmt.Relation.Relname}
+	exists := ng.getTable(table.Name)
+	if exists != nil {
+		return fmt.Errorf("table '%s' already exists", table.Name)
+	}
+
+	for _, c := range stmt.TableElts {
+		coldef := c.GetColumnDef()
+		table.ColumnNames = append(table.ColumnNames, coldef.Colname)
+
+		var columnType string
+		for _, n := range coldef.TypeName.Names {
+			if columnType != "" {
+				columnType += "."
+			}
+			columnType += n.GetString_().Sval
+		}
+		table.ColumnTypes = append(table.ColumnTypes, columnType)
+	}
+
+	err := ng.writeTable(table)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -76,10 +124,34 @@ func (ng *Engine) Execute(query string) error {
 	return nil
 }
 
+func (ng *Engine) Setup() error {
+	return ng.db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(ng.bucketName)
+		return err
+	})
+}
+
 type TableDefinition struct {
 	Name        string
 	ColumnNames []string
 	ColumnTypes []string
+}
+
+func (td *TableDefinition) Encode() []byte {
+	b, err := json.Marshal(*td)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func DecodeTableDef(b []byte) *TableDefinition {
+	var def TableDefinition
+	err := json.Unmarshal(b, &def)
+	if err != nil {
+		return nil
+	}
+	return &def
 }
 
 type PostQueryRequest struct {
@@ -148,6 +220,11 @@ func main() {
 
 	engine := NewEngine(db)
 
+	err = engine.Setup()
+	if err != nil {
+		panic(err)
+	}
+
 	http.HandleFunc("POST /follower", func(w http.ResponseWriter, r *http.Request) {
 		if hasAuth, err := HasAuth(r.Header.Get("Authorization"), user, password); !hasAuth {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -179,7 +256,11 @@ func main() {
 			query = req.Query
 		}
 
-		engine.Execute(query)
+		err = engine.Execute(query)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Running query: " + query + "\n"))
