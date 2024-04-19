@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
@@ -50,6 +51,22 @@ func (ng *Engine) writeTable(table TableDefinition) error {
 	})
 }
 
+func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
+	id := generateId()
+	key := []byte("row:" + table.Name + ":" + id)
+
+	// Encode
+	rowb, err := json.Marshal(row)
+	if err != nil {
+		return errors.New("error while encoding row")
+	}
+
+	return ng.db.Update(func(tx *bolt.Tx) error {
+		buck := tx.Bucket(ng.bucketName)
+		return buck.Put(key, rowb)
+	})
+}
+
 func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 	table := TableDefinition{Name: stmt.Relation.Relname}
 	exists := ng.getTable(table.Name)
@@ -80,8 +97,48 @@ func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 }
 
 func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
-	fmt.Println("Executing insert")
-	return nil
+	table := ng.getTable(stmt.Relation.Relname)
+	if table == nil {
+		return fmt.Errorf("table '%s' does not exist", stmt.Relation.Relname)
+	}
+
+	sel := stmt.GetSelectStmt().GetSelectStmt()
+	var row []any
+	for _, values := range sel.ValuesLists {
+		for _, value := range values.GetList().Items {
+			if f := value.GetColumnRef(); f != nil {
+				for _, str := range f.Fields {
+					if s := str.GetString_(); s != nil {
+						row = append(row, s.Sval)
+					}
+				}
+				continue
+			}
+
+			if c := value.GetAConst(); c != nil {
+				if s := c.GetSval(); s != nil {
+					row = append(row, s.Sval)
+					continue
+				}
+				if i := c.GetIval(); i != nil {
+					row = append(row, i.Ival)
+					continue
+				}
+				if b := c.GetBoolval(); b != nil {
+					row = append(row, b.Boolval)
+					continue
+				}
+			}
+
+			return fmt.Errorf("unknown value type '%s'", value)
+		}
+	}
+
+	if len(table.ColumnNames) != len(row) {
+		return errors.New("invalid number of values")
+	}
+
+	return ng.writeRow(table, row)
 }
 
 func (ng *Engine) executeUpdate(stmt *pgquery.UpdateStmt) error {
@@ -196,13 +253,20 @@ func pathExists(p string) bool {
 }
 
 func main() {
-	var httpPort, raftPort, user, password, dataDir string
+	var (
+		httpPort, raftPort, user, password, dataDir string
+		authDisabled                                bool
+	)
+
 	flag.StringVar(&httpPort, "http-port", "6000", "Http port")
 	flag.StringVar(&raftPort, "raft-port", "6001", "Raft port")
 	flag.StringVar(&user, "user", "pglite", "User")
 	flag.StringVar(&password, "password", "password", "Password")
 	flag.StringVar(&dataDir, "data-dir", "pglite-data", "Data directory")
+	flag.BoolVar(&authDisabled, "noauth", false, "Disable authentication")
 	flag.Parse()
+
+	enableAuth := !authDisabled
 
 	if !pathExists(dataDir) {
 		log.Println("Creating data dir at", dataDir)
@@ -235,9 +299,11 @@ func main() {
 		w.Write([]byte("Follower added"))
 	})
 	http.HandleFunc("POST /query", func(w http.ResponseWriter, r *http.Request) {
-		if hasAuth, err := HasAuth(r.Header.Get("Authorization"), user, password); !hasAuth {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
+		if enableAuth {
+			if hasAuth, err := HasAuth(r.Header.Get("Authorization"), user, password); !hasAuth {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
 		}
 
 		body, err := io.ReadAll(r.Body)
@@ -270,4 +336,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func generateId() string {
+	const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	b := make([]byte, 20)
+	for i := range b {
+		b[i] = letterBytes[rand.Intn(len(letterBytes))]
+	}
+	return string(b)
 }
