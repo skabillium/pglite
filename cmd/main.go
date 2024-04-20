@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strings"
 
 	pgquery "github.com/pganalyze/pg_query_go/v5"
@@ -49,6 +51,34 @@ func (ng *Engine) writeTable(table TableDefinition) error {
 		return buck.Put(key, table.Encode())
 
 	})
+}
+
+func (ng *Engine) getAllRows(table *TableDefinition, fields []string) ([][]any, error) {
+	var results [][]any
+	err := ng.db.View(func(tx *bolt.Tx) error {
+		prefix := []byte("row:" + table.Name + ":")
+		cursor := tx.Bucket(ng.bucketName).Cursor()
+		for k, v := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = cursor.Next() {
+			var row []any
+			err := json.Unmarshal(v, &row)
+			if err != nil {
+				return fmt.Errorf("unable to unmarshal row: %s", err)
+			}
+
+			var selected []any
+			for _, field := range fields {
+				selected = append(selected, row[slices.Index(table.ColumnNames, field)])
+			}
+			results = append(results, selected)
+		}
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return results, nil
 }
 
 func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
@@ -94,6 +124,49 @@ func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 	}
 
 	return nil
+}
+
+type SelectResult struct {
+	Fields []string `json:"fieldNames"`
+	Types  []string `json:"fieldTypes"`
+	Rows   [][]any  `json:"rows"`
+}
+
+func (ng *Engine) executeSelect(stmt *pgquery.SelectStmt) (*SelectResult, error) {
+	tablename := stmt.FromClause[0].GetRangeVar().Relname
+	table := ng.getTable(tablename)
+	if table == nil {
+		return nil, fmt.Errorf("relation '%s' does not exist", tablename)
+	}
+
+	var fieldNames []string
+	for _, t := range stmt.TargetList {
+		field := t.GetResTarget().Val.GetColumnRef().Fields[0]
+		if field.GetAStar() != nil {
+			fieldNames = table.ColumnNames
+			break
+		}
+
+		fieldName := field.GetString_().Sval
+		fieldNames = append(fieldNames, fieldName)
+	}
+
+	// TODO: Validate that all rows exist on table
+	var fieldTypes []string
+	for _, f := range fieldNames {
+		idx := slices.Index(table.ColumnNames, f)
+		if idx == -1 {
+			return nil, fmt.Errorf("column '%s' does not exist on table '%s'", f, table.Name)
+		}
+		fieldTypes = append(fieldTypes, table.ColumnTypes[idx])
+	}
+
+	rows, err := ng.getAllRows(table, fieldNames)
+	if err != nil {
+		return nil, err
+	}
+
+	return &SelectResult{Fields: fieldNames, Types: fieldTypes, Rows: rows}, nil
 }
 
 func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
@@ -151,34 +224,38 @@ func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) error {
 	return nil
 }
 
-func (ng *Engine) Execute(query string) error {
+func (ng *Engine) Execute(query string) (any, error) {
 	res, err := pgquery.Parse(query)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, s := range res.Stmts {
 		stmt := s.GetStmt()
 		if stmt := stmt.GetCreateStmt(); stmt != nil {
-			return ng.executeCreate(stmt)
+			return nil, ng.executeCreate(stmt)
+		}
+
+		if stmt := stmt.GetSelectStmt(); stmt != nil {
+			return ng.executeSelect(stmt)
 		}
 
 		if stmt := stmt.GetInsertStmt(); stmt != nil {
-			return ng.executeInsert(stmt)
+			return nil, ng.executeInsert(stmt)
 		}
 
 		if stmt := stmt.GetUpdateStmt(); stmt != nil {
-			return ng.executeUpdate(stmt)
+			return nil, ng.executeUpdate(stmt)
 		}
 
 		if stmt := stmt.GetDeleteStmt(); stmt != nil {
-			return ng.executeDelete(stmt)
+			return nil, ng.executeDelete(stmt)
 		}
 
-		return errors.New("Statement not supported")
+		return nil, errors.New("Statement not supported")
 	}
 
-	return nil
+	return nil, nil
 }
 
 func (ng *Engine) Setup() error {
@@ -322,14 +399,24 @@ func main() {
 			query = req.Query
 		}
 
-		err = engine.Execute(query)
+		res, err := engine.Execute(query)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Running query: " + query + "\n"))
+		if res == nil {
+			w.Write([]byte("Succesfully executed query: " + query + "\n"))
+			return
+		}
+
+		b, err := json.Marshal(res)
+		if err != nil {
+			w.Write([]byte("Could not marshal response \n"))
+			return
+		}
+		w.Write(b)
 	})
 
 	err = http.ListenAndServe(":"+httpPort, nil)
