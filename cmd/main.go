@@ -96,15 +96,18 @@ func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
 	})
 }
 
-func (ng *Engine) deleteAllRows(table *TableDefinition) error {
-	return ng.db.Update(func(tx *bolt.Tx) error {
+func (ng *Engine) deleteAllRows(table *TableDefinition) (int, error) {
+	var deleted int
+	err := ng.db.Update(func(tx *bolt.Tx) error {
 		prefix := []byte("row:" + table.Name + ":")
 		cursor := tx.Bucket(ng.bucketName).Cursor()
 		for k, _ := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cursor.Next() {
 			cursor.Delete()
+			deleted++
 		}
 		return nil
 	})
+	return deleted, err
 }
 
 func (ng *Engine) deleteRowById(table *TableDefinition, id string) error {
@@ -238,11 +241,15 @@ func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
 	return ng.writeRow(table, row)
 }
 
-func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) error {
+type DeleteResult struct {
+	Count int `json:"count"`
+}
+
+func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) (int, error) {
 	tablename := stmt.Relation.Relname
 	table := ng.getTable(tablename)
 	if table == nil {
-		return fmt.Errorf("relation '%s' does not exist", tablename)
+		return -1, fmt.Errorf("relation '%s' does not exist", tablename)
 	}
 
 	// Only support deleting by id
@@ -252,19 +259,19 @@ func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) error {
 
 	where := stmt.WhereClause.GetAExpr()
 	if where == nil {
-		return errors.New("only deletion by id is supported")
+		return -1, errors.New("only deletion by id is supported")
 	}
 
 	if where.Lexpr.GetColumnRef().Fields[0].GetString_().Sval != "id" || where.Name[0].GetString_().Sval != "=" {
-		return errors.New("only deletion by id is supported")
+		return -1, errors.New("only deletion by id is supported")
 	}
 
 	aconst := where.Rexpr.GetAConst()
 	if aconst == nil {
-		return errors.New("id should be a string")
+		return -1, errors.New("id should be a string")
 	}
 
-	return ng.deleteRowById(table, aconst.GetSval().Sval)
+	return 1, ng.deleteRowById(table, aconst.GetSval().Sval)
 }
 
 func (ng *Engine) Execute(query string) (any, error) {
@@ -288,7 +295,11 @@ func (ng *Engine) Execute(query string) (any, error) {
 	}
 
 	if stmt := stmt.GetDeleteStmt(); stmt != nil {
-		return nil, ng.executeDelete(stmt)
+		count, err := ng.executeDelete(stmt)
+		if err != nil {
+			return nil, err
+		}
+		return DeleteResult{Count: count}, nil
 	}
 
 	return nil, errors.New("statement not supported")
@@ -357,12 +368,6 @@ func HasAuth(authHeader string, user string, pwd string) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// Check if a path (file/dir) exists in the file system
-func pathExists(p string) bool {
-	_, err := os.Stat(p)
-	return !errors.Is(err, os.ErrNotExist)
 }
 
 func main() {
@@ -468,4 +473,10 @@ func generateId() string {
 		b[i] = letterBytes[rand.Intn(len(letterBytes))]
 	}
 	return string(b)
+}
+
+// Check if a path (file/dir) exists in the file system
+func pathExists(p string) bool {
+	_, err := os.Stat(p)
+	return !errors.Is(err, os.ErrNotExist)
 }
