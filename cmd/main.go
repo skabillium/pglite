@@ -85,16 +85,25 @@ func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
 	id := row[0].(string)
 	key := []byte("row:" + table.Name + ":" + id)
 
-	// Encode
 	rowb, err := json.Marshal(row)
 	if err != nil {
 		return errors.New("error while encoding row")
 	}
 
-	log.Println("Inserting row with id", id)
 	return ng.db.Update(func(tx *bolt.Tx) error {
 		buck := tx.Bucket(ng.bucketName)
 		return buck.Put(key, rowb)
+	})
+}
+
+func (ng *Engine) deleteAllRows(table *TableDefinition) error {
+	return ng.db.Update(func(tx *bolt.Tx) error {
+		prefix := []byte("row:" + table.Name + ":")
+		cursor := tx.Bucket(ng.bucketName).Cursor()
+		for k, _ := cursor.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = cursor.Next() {
+			cursor.Delete()
+		}
+		return nil
 	})
 }
 
@@ -238,7 +247,7 @@ func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) error {
 
 	// Only support deleting by id
 	if stmt.WhereClause == nil {
-		log.Println("Deleting all rows")
+		return ng.deleteAllRows(table)
 	}
 
 	where := stmt.WhereClause.GetAExpr()
