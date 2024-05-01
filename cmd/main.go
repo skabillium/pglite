@@ -82,7 +82,7 @@ func (ng *Engine) getAllRows(table *TableDefinition, fields []string) ([][]any, 
 }
 
 func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
-	id := generateId()
+	id := row[0].(string)
 	key := []byte("row:" + table.Name + ":" + id)
 
 	// Encode
@@ -91,14 +91,27 @@ func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
 		return errors.New("error while encoding row")
 	}
 
+	log.Println("Inserting row with id", id)
 	return ng.db.Update(func(tx *bolt.Tx) error {
 		buck := tx.Bucket(ng.bucketName)
 		return buck.Put(key, rowb)
 	})
 }
 
+func (ng *Engine) deleteRowById(table *TableDefinition, id string) error {
+	return ng.db.Update(func(tx *bolt.Tx) error {
+		buck := tx.Bucket(ng.bucketName)
+		key := []byte("row:" + table.Name + ":" + id)
+		return buck.Delete(key)
+	})
+}
+
 func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
-	table := TableDefinition{Name: stmt.Relation.Relname}
+	table := TableDefinition{
+		Name:        stmt.Relation.Relname,
+		ColumnNames: []string{"id"},
+		ColumnTypes: []string{"pg_calalog.varchar"},
+	}
 	exists := ng.getTable(table.Name)
 	if exists != nil {
 		return fmt.Errorf("table '%s' already exists", table.Name)
@@ -106,6 +119,9 @@ func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 
 	for _, c := range stmt.TableElts {
 		coldef := c.GetColumnDef()
+		if coldef.Colname == "id" {
+			continue
+		}
 		table.ColumnNames = append(table.ColumnNames, coldef.Colname)
 
 		var columnType string
@@ -151,7 +167,6 @@ func (ng *Engine) executeSelect(stmt *pgquery.SelectStmt) (*SelectResult, error)
 		fieldNames = append(fieldNames, fieldName)
 	}
 
-	// TODO: Validate that all rows exist on table
 	var fieldTypes []string
 	for _, f := range fieldNames {
 		idx := slices.Index(table.ColumnNames, f)
@@ -176,7 +191,7 @@ func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
 	}
 
 	sel := stmt.GetSelectStmt().GetSelectStmt()
-	var row []any
+	row := []any{generateId()}
 	for _, values := range sel.ValuesLists {
 		for _, value := range values.GetList().Items {
 			if f := value.GetColumnRef(); f != nil {
@@ -214,14 +229,33 @@ func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
 	return ng.writeRow(table, row)
 }
 
-func (ng *Engine) executeUpdate(stmt *pgquery.UpdateStmt) error {
-	fmt.Println("Executing update")
-	return nil
-}
-
 func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) error {
-	fmt.Println("Executing delete")
-	return nil
+	tablename := stmt.Relation.Relname
+	table := ng.getTable(tablename)
+	if table == nil {
+		return fmt.Errorf("relation '%s' does not exist", tablename)
+	}
+
+	// Only support deleting by id
+	if stmt.WhereClause == nil {
+		log.Println("Deleting all rows")
+	}
+
+	where := stmt.WhereClause.GetAExpr()
+	if where == nil {
+		return errors.New("only deletion by id is supported")
+	}
+
+	if where.Lexpr.GetColumnRef().Fields[0].GetString_().Sval != "id" || where.Name[0].GetString_().Sval != "=" {
+		return errors.New("only deletion by id is supported")
+	}
+
+	aconst := where.Rexpr.GetAConst()
+	if aconst == nil {
+		return errors.New("id should be a string")
+	}
+
+	return ng.deleteRowById(table, aconst.GetSval().Sval)
 }
 
 func (ng *Engine) Execute(query string) (any, error) {
@@ -230,32 +264,25 @@ func (ng *Engine) Execute(query string) (any, error) {
 		return nil, err
 	}
 
-	for _, s := range res.Stmts {
-		stmt := s.GetStmt()
-		if stmt := stmt.GetCreateStmt(); stmt != nil {
-			return nil, ng.executeCreate(stmt)
-		}
-
-		if stmt := stmt.GetSelectStmt(); stmt != nil {
-			return ng.executeSelect(stmt)
-		}
-
-		if stmt := stmt.GetInsertStmt(); stmt != nil {
-			return nil, ng.executeInsert(stmt)
-		}
-
-		if stmt := stmt.GetUpdateStmt(); stmt != nil {
-			return nil, ng.executeUpdate(stmt)
-		}
-
-		if stmt := stmt.GetDeleteStmt(); stmt != nil {
-			return nil, ng.executeDelete(stmt)
-		}
-
-		return nil, errors.New("Statement not supported")
+	// Only support single statements
+	stmt := res.Stmts[0].GetStmt()
+	if stmt := stmt.GetCreateStmt(); stmt != nil {
+		return nil, ng.executeCreate(stmt)
 	}
 
-	return nil, nil
+	if stmt := stmt.GetSelectStmt(); stmt != nil {
+		return ng.executeSelect(stmt)
+	}
+
+	if stmt := stmt.GetInsertStmt(); stmt != nil {
+		return nil, ng.executeInsert(stmt)
+	}
+
+	if stmt := stmt.GetDeleteStmt(); stmt != nil {
+		return nil, ng.executeDelete(stmt)
+	}
+
+	return nil, errors.New("statement not supported")
 }
 
 func (ng *Engine) Setup() error {
