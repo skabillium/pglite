@@ -19,3 +19,10 @@ Install the project with `make install` and run `make build`. This will output t
 at the available command-line options with `./pglite --help`.
 
 If for example you want to run the server without any authentication run `pglite --noauth`
+
+## Executing queries
+To execute a query, send an HTTP POST at /query like this:
+```sh
+curl -X POST localhost:6000 \
+-d 'SELECT * FROM users'
+```
