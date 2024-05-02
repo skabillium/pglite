@@ -20,6 +20,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+// Storage engine implementation using "bbolt". This structure is responsible for
+// providing the necessary primitives for reading entities like tables and rows.
 type Engine struct {
 	db         *bolt.DB
 	bucketName []byte
@@ -29,6 +31,7 @@ func NewEngine(db *bolt.DB) *Engine {
 	return &Engine{db, []byte("data")}
 }
 
+// Fetch a table definition by name
 func (ng *Engine) getTable(name string) *TableDefinition {
 	key := "tables:" + name
 	var tableDef *TableDefinition
@@ -44,6 +47,7 @@ func (ng *Engine) getTable(name string) *TableDefinition {
 	return tableDef
 }
 
+// Write a table definitio to disk
 func (ng *Engine) writeTable(table TableDefinition) error {
 	key := []byte("tables:" + table.Name)
 	return ng.db.Update(func(tx *bolt.Tx) error {
@@ -53,6 +57,7 @@ func (ng *Engine) writeTable(table TableDefinition) error {
 	})
 }
 
+// Get a table's rows
 func (ng *Engine) getAllRows(table *TableDefinition, fields []string) ([][]any, error) {
 	var results [][]any
 	err := ng.db.View(func(tx *bolt.Tx) error {
@@ -81,6 +86,7 @@ func (ng *Engine) getAllRows(table *TableDefinition, fields []string) ([][]any, 
 	return results, nil
 }
 
+// Write a row to disk
 func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
 	id := row[0].(string)
 	key := []byte("row:" + table.Name + ":" + id)
@@ -96,6 +102,7 @@ func (ng *Engine) writeRow(table *TableDefinition, row []any) error {
 	})
 }
 
+// Delete all rows from a table
 func (ng *Engine) deleteAllRows(table *TableDefinition) (int, error) {
 	var deleted int
 	err := ng.db.Update(func(tx *bolt.Tx) error {
@@ -110,6 +117,7 @@ func (ng *Engine) deleteAllRows(table *TableDefinition) (int, error) {
 	return deleted, err
 }
 
+// Delete a single row by id
 func (ng *Engine) deleteRowById(table *TableDefinition, id string) error {
 	return ng.db.Update(func(tx *bolt.Tx) error {
 		buck := tx.Bucket(ng.bucketName)
@@ -118,6 +126,7 @@ func (ng *Engine) deleteRowById(table *TableDefinition, id string) error {
 	})
 }
 
+// Execute a "CREATE TABLE" statement
 func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 	table := TableDefinition{
 		Name:        stmt.Relation.Relname,
@@ -154,12 +163,14 @@ func (ng *Engine) executeCreate(stmt *pgquery.CreateStmt) error {
 	return nil
 }
 
+// Contains all information returned by a "SELECT" query
 type SelectResult struct {
 	Fields []string `json:"fieldNames"`
 	Types  []string `json:"fieldTypes"`
 	Rows   [][]any  `json:"rows"`
 }
 
+// Executes a "SELECT" statement
 func (ng *Engine) executeSelect(stmt *pgquery.SelectStmt) (*SelectResult, error) {
 	tablename := stmt.FromClause[0].GetRangeVar().Relname
 	table := ng.getTable(tablename)
@@ -196,6 +207,7 @@ func (ng *Engine) executeSelect(stmt *pgquery.SelectStmt) (*SelectResult, error)
 	return &SelectResult{Fields: fieldNames, Types: fieldTypes, Rows: rows}, nil
 }
 
+// Executes and "INSERT" statement
 func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
 	table := ng.getTable(stmt.Relation.Relname)
 	if table == nil {
@@ -241,10 +253,12 @@ func (ng *Engine) executeInsert(stmt *pgquery.InsertStmt) error {
 	return ng.writeRow(table, row)
 }
 
+// Result containing number of deleted rows
 type DeleteResult struct {
 	Count int `json:"count"`
 }
 
+// Executes a "DELETE" statement
 func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) (int, error) {
 	tablename := stmt.Relation.Relname
 	table := ng.getTable(tablename)
@@ -274,6 +288,8 @@ func (ng *Engine) executeDelete(stmt *pgquery.DeleteStmt) (int, error) {
 	return 1, ng.deleteRowById(table, aconst.GetSval().Sval)
 }
 
+// Parses an SQL query from a string and calls the correct function for the specified statement
+// Only "CREATE TABLE", "INSERT", "SELECT" & "DELETE" statements are supported
 func (ng *Engine) Execute(query string) (any, error) {
 	res, err := pgquery.Parse(query)
 	if err != nil {
@@ -305,6 +321,7 @@ func (ng *Engine) Execute(query string) (any, error) {
 	return nil, errors.New("statement not supported")
 }
 
+// Create bucket for database storage
 func (ng *Engine) Setup() error {
 	return ng.db.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(ng.bucketName)
@@ -312,12 +329,15 @@ func (ng *Engine) Setup() error {
 	})
 }
 
+// Stores all information required for a table definition. This includes
+// names and types for every defined column
 type TableDefinition struct {
 	Name        string
 	ColumnNames []string
 	ColumnTypes []string
 }
 
+// Encode a table definition as json
 func (td *TableDefinition) Encode() []byte {
 	b, err := json.Marshal(*td)
 	if err != nil {
@@ -326,6 +346,7 @@ func (td *TableDefinition) Encode() []byte {
 	return b
 }
 
+// Decode a table definition from json
 func DecodeTableDef(b []byte) *TableDefinition {
 	var def TableDefinition
 	err := json.Unmarshal(b, &def)
@@ -339,6 +360,7 @@ type PostQueryRequest struct {
 	Query string `json:"query"`
 }
 
+// Check if the "Authorization" header contains basic user password auth
 func HasAuth(authHeader string, user string, pwd string) (bool, error) {
 	if authHeader == "" {
 		return false, errors.New("empty authorization header")
@@ -407,15 +429,6 @@ func main() {
 		panic(err)
 	}
 
-	http.HandleFunc("POST /follower", func(w http.ResponseWriter, r *http.Request) {
-		if hasAuth, err := HasAuth(r.Header.Get("Authorization"), user, password); !hasAuth {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("Follower added"))
-	})
 	http.HandleFunc("POST /query", func(w http.ResponseWriter, r *http.Request) {
 		if enableAuth {
 			if hasAuth, err := HasAuth(r.Header.Get("Authorization"), user, password); !hasAuth {
@@ -426,15 +439,17 @@ func main() {
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "Failed to read request body 1", http.StatusBadRequest)
+			http.Error(w, "Failed to read request body", http.StatusBadRequest)
 			return
 		}
+
+		// Endpoint accepts both text and json bodies
 		query := string(body)
 		if r.Header.Get("Content-Type") == "application/json" {
 			var req PostQueryRequest
 			err = json.Unmarshal(body, &req)
 			if err != nil {
-				http.Error(w, "Failed to read request body 2", http.StatusBadRequest)
+				http.Error(w, "Failed to parse json from request body", http.StatusBadRequest)
 				return
 			}
 			query = req.Query
@@ -466,6 +481,7 @@ func main() {
 	}
 }
 
+// Generate a random id for a table's row
 func generateId() string {
 	const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	b := make([]byte, 20)
