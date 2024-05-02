@@ -394,12 +394,11 @@ func HasAuth(authHeader string, user string, pwd string) (bool, error) {
 
 func main() {
 	var (
-		httpPort, raftPort, user, password, dataDir string
-		authDisabled                                bool
+		httpPort, user, password, dataDir string
+		authDisabled                      bool
 	)
 
 	flag.StringVar(&httpPort, "http-port", "6000", "Http port")
-	flag.StringVar(&raftPort, "raft-port", "6001", "Raft port")
 	flag.StringVar(&user, "user", "pglite", "User")
 	flag.StringVar(&password, "password", "password", "Password")
 	flag.StringVar(&dataDir, "data-dir", "pglite-data", "Data directory")
